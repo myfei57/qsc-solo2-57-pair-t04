@@ -45,6 +45,14 @@ def _dump(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
+def _demo_curve_supply(limits, outdoor_c: float) -> float:
+    """演示用"实际供温"：相对出厂经验线冷端抬、暖端压。"""
+
+    span = (outdoor_c - limits.outdoor_min_c) / (limits.outdoor_max_c - limits.outdoor_min_c)
+    empirical = limits.supply_high_c + (limits.supply_low_c - limits.supply_high_c) * span
+    return empirical - 0.25 * (outdoor_c + 4.0)
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     platform = _build(args)
     server = ConsoleServer(platform, host=args.host, port=args.port)
@@ -95,6 +103,23 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     queued = platform.queue_commands(args.station, [55.0, 62.0], "demo-operator")
     replayed = platform.replay_valves([args.station])
     disturbance = platform.disturb_secondary(args.disturb)
+    # 曲线换代演示：先下一单（冻结在老版），再用"冷抬暖压"的运行采样重新拟合，
+    # 最后应用老单——它仍按换代前冻结的版本算供温。
+    limits = platform.config.curve
+    curve_samples = [
+        {
+            "outdoor_c": limits.outdoor_min_c + step * (limits.outdoor_max_c - limits.outdoor_min_c) / 119.0,
+            "supply_c": _demo_curve_supply(
+                limits,
+                limits.outdoor_min_c + step * (limits.outdoor_max_c - limits.outdoor_min_c) / 119.0,
+            ),
+        }
+        for step in range(120)
+    ]
+    curve_samples.append({"outdoor_c": limits.outdoor_max_c + 5.0, "supply_c": 60.0})  # 越界采样，计入丢点
+    frozen_order = platform.issue_quality_order(args.outdoor_c, "demo-operator")
+    curve_refit = platform.refit_curve(curve_samples)
+    frozen_applied = platform.apply_quality_order(frozen_order["order_id"])
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     trip = platform.trip("demo-complete")
     reset = platform.reset_source("demo-operator")
@@ -125,6 +150,17 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "queued": queued,
         "replayed": {key: replayed[key] for key in ("ok", "replayed", "applied")},
         "disturbance": disturbance,
+        "curve_refit": {
+            key: curve_refit[key]
+            for key in ("version", "previous_version", "segmenting", "dropped_total", "fitted_segments",
+                        "fallback_segments")
+        },
+        "frozen_order": {
+            "order_id": frozen_applied["order_id"],
+            "curve_version": frozen_applied["curve_version"],
+            "target_supply_c": frozen_applied["target_supply_c"],
+            "status": frozen_applied["status"],
+        },
         "concurrency": concurrency,
         "trip": {key: trip[key] for key in ("ok", "state", "reason", "trips")},
         "reset": {key: reset[key] for key in ("ok", "state")},

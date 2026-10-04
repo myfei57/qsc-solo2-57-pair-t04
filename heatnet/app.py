@@ -47,6 +47,7 @@ from .store.journal import JsonlJournal
 from .store.metrics import StoreMetrics
 from .store.state import DurableState
 from .temp.curve import HeatCurve
+from .temp.fitting import normalize_samples
 from .temp.forecast import build_forecast, describe_forecast
 from .telemetry import TrendBuffer
 from .valve.move import load_valve
@@ -348,6 +349,158 @@ class Platform:
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def refit_curve(self, raw_samples: list[dict], fallback_policies: object = None) -> dict:
+        """按运行采样把曲线分段重新拟合并换代。
+
+        采样丢点是部分失败：丢点只计数、不参与拟合，换代照常进行并落 warning 审计；
+        一个可用点都没有时拟合整体失败，老版本原样保留，落 alarm 审计。
+        """
+
+        with self._lock:
+            now = self.clock.now()
+            samples, dropped = normalize_samples(self.config.curve, list(raw_samples))
+            dropped_total = sum(dropped.values())
+            before_version = self.curve.version()
+            try:
+                result = self.curve.refit(
+                    samples,
+                    dropped,
+                    now,
+                    source="runtime-refit",
+                    fallback_policies=fallback_policies,
+                )
+            except PlantError as error:
+                self.bus.publish(
+                    Event.of(
+                        "temp",
+                        "temp",
+                        "curve_refit_rejected",
+                        severity="alarm",
+                        message="曲线换代失败，沿用老版本",
+                        previous_version=before_version,
+                        used_samples=len(samples),
+                        dropped_total=dropped_total,
+                        dropped=dict(dropped),
+                        reason=error.message,
+                    )
+                )
+                raise
+            version = self.curve.version_info()
+            payload = {
+                "ok": True,
+                "version": version.version,
+                "previous_version": before_version,
+                "segmenting": version.segmenting,
+                "points": version.table_points(),
+                "segments": version.describe_segments(),
+                "used_samples": result.used_samples,
+                "dropped": dict(result.dropped),
+                "dropped_total": result.dropped_total,
+                "fitted_segments": result.fitted_segments,
+                "fallback_segments": result.fallback_segments,
+                "created_at": round(version.created_at, 3),
+            }
+            self.bus.publish(
+                Event.of(
+                    "temp",
+                    "temp",
+                    "curve_refit",
+                    severity="warning" if result.dropped_total else "notice",
+                    message=(
+                        f"曲线换代 v{before_version}→v{version.version}（有采样丢点）"
+                        if result.dropped_total
+                        else f"曲线换代 v{before_version}→v{version.version}"
+                    ),
+                    version=version.version,
+                    previous_version=before_version,
+                    segmenting=version.segmenting,
+                    used_samples=result.used_samples,
+                    dropped=dict(result.dropped),
+                    dropped_total=result.dropped_total,
+                    fitted_segments=result.fitted_segments,
+                    fallback_segments=result.fallback_segments,
+                    segments=version.describe_segments(),
+                )
+            )
+            self._persist()
+            return payload
+
+    def issue_quality_order(self, outdoor_c: float, origin: str = "console") -> dict:
+        """下发一单调质：冻结当前曲线版本，供温按冻结版本算。"""
+
+        with self._lock:
+            order = self.curve.issue_quality_order(outdoor_c, self.clock.now(), origin)
+            payload = order.as_dict()
+            self.bus.publish(
+                Event.of(
+                    "temp",
+                    "temp",
+                    "quality_order_issued",
+                    severity="notice",
+                    message=f"调质单 {order.order_id} 下发（曲线 v{order.curve_version}）",
+                    **payload,
+                )
+            )
+            return payload
+
+    def apply_quality_order(self, order_id: str) -> dict:
+        """应用已下发的调质单：按单子冻结的版本取供温并让热源点火。
+
+        换代不改老单：应用时重新按冻结版本插值，再让热源按这个温度调质。
+        """
+
+        with self._lock:
+            order = self.curve.resolve_quality_order(order_id)
+            fired = self.source.fire(order.target_supply_c)
+            payload = order.as_dict()
+            payload["fired_supply_c"] = round(fired, 2)
+            self.bus.publish(
+                Event.of(
+                    "temp",
+                    "temp",
+                    "quality_order_applied",
+                    severity="notice",
+                    message=f"调质单 {order.order_id} 应用（按曲线 v{order.curve_version}）",
+                    **payload,
+                )
+            )
+            return payload
+
+    def cancel_quality_order(self, order_id: str) -> dict:
+        """撤销一单尚未应用的调质（仍按其冻结版本记录，只是不再执行）。"""
+
+        with self._lock:
+            order = self.curve.cancel_quality_order(order_id)
+            payload = order.as_dict()
+            self.bus.publish(
+                Event.of(
+                    "temp",
+                    "temp",
+                    "quality_order_cancelled",
+                    severity="warning",
+                    message=f"调质单 {order.order_id} 撤销",
+                    **payload,
+                )
+            )
+            return payload
+
+    def quality_orders(self) -> dict:
+        """列出全部调质单，供控制台核对哪一单冻结在哪一版。"""
+
+        with self._lock:
+            return {"orders": [order.as_dict() for order in self.curve.orders()]}
+
+    def curve_supply(self, version: int, outdoor_c: float) -> dict:
+        """按指定版本查供温：复算"已下发的单子当年是多少"用同一口径。"""
+
+        with self._lock:
+            supply = self.curve.supply_for_version(version, outdoor_c)
+            return {
+                "version": version,
+                "outdoor_c": round(float(outdoor_c), 2),
+                "supply_c": round(supply, 2),
+            }
 
     def adjust_source(
         self, temperature_c: float, flow_t_h: float, origin: str = "manual"
@@ -727,6 +880,9 @@ class Platform:
         snapshot = self.curve.snapshot(self.clock.now())
         payload = snapshot.as_dict()
         payload["range"] = [self.config.curve.outdoor_min_c, self.config.curve.outdoor_max_c]
+        version = self.curve.version_info()
+        payload["version_info"] = version.as_dict()
+        payload["segments"] = version.describe_segments()
         return payload
 
     def outdoor_forecast(self, outdoor_c: float | None = None, steps: int = 5) -> dict:

@@ -16,6 +16,8 @@ class CurveSnapshot:
     stale: bool
     validated: int
     rejected: int
+    curve_version: int
+    segmenting: str
 
     def as_dict(self) -> dict:
         return {
@@ -26,4 +28,6 @@ class CurveSnapshot:
             "stale": self.stale,
             "validated": self.validated,
             "rejected": self.rejected,
+            "curve_version": self.curve_version,
+            "segmenting": self.segmenting,
         }

@@ -46,6 +46,8 @@ class Api:
         add("GET", "/api/station/{name}", self._station)
         add("GET", "/api/valves", self._valves)
         add("GET", "/api/curve", self._curve)
+        add("GET", "/api/curve/orders", self._curve_orders)
+        add("GET", "/api/curve/supply", self._curve_supply)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
@@ -59,6 +61,10 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/weather", self._weather)
+        add("POST", "/api/curve/refit", self._curve_refit)
+        add("POST", "/api/curve/order", self._curve_order)
+        add("POST", "/api/curve/order/apply", self._curve_order_apply)
+        add("POST", "/api/curve/order/cancel", self._curve_order_cancel)
         add("POST", "/api/adjust", self._adjust)
         add("POST", "/api/startup", self._startup)
         add("POST", "/api/shutdown", self._shutdown)
@@ -161,6 +167,33 @@ class Api:
         payload = self._platform.curve_report()
         payload["table"] = self._platform.curve.table.points()
         return payload
+
+    def _curve_refit(self, params: dict, body: dict) -> dict:
+        raw_samples = body.get("samples")
+        if not isinstance(raw_samples, list):
+            raise PlantError("参数 'samples' 必须是采样数组", component="console")
+        policies = body.get("fallback_policies")
+        return self._platform.refit_curve(raw_samples, policies)
+
+    def _curve_order(self, params: dict, body: dict) -> dict:
+        return self._platform.issue_quality_order(
+            _as_float(body, "outdoor_c", 0.0), str(body.get("origin", "console"))
+        )
+
+    def _curve_order_apply(self, params: dict, body: dict) -> dict:
+        return self._platform.apply_quality_order(str(body.get("order_id", "")))
+
+    def _curve_order_cancel(self, params: dict, body: dict) -> dict:
+        return self._platform.cancel_quality_order(str(body.get("order_id", "")))
+
+    def _curve_orders(self, params: dict, body: dict) -> dict:
+        return self._platform.quality_orders()
+
+    def _curve_supply(self, params: dict, body: dict) -> dict:
+        return self._platform.curve_supply(
+            int(params.get("version", self._platform.curve.version())),
+            _as_float(params, "outdoor_c", 0.0),
+        )
 
     def _forecast(self, params: dict, body: dict) -> dict:
         outside = params.get("outdoor_c")

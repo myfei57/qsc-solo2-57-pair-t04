@@ -49,3 +49,7 @@ class NamespaceError(PlantError):
 
 class ForecastError(PlantError):
     """气象预报越界或曲线过期，禁止据此调质。"""
+
+
+class CurveFitError(PlantError):
+    """曲线换代整轮失败（如没有任何可用采样），新版本不得生效。"""
