@@ -46,6 +46,11 @@ class Api:
         add("GET", "/api/station/{name}", self._station)
         add("GET", "/api/valves", self._valves)
         add("GET", "/api/curve", self._curve)
+        add("GET", "/api/curve/segments", self._curve_segments)
+        add("GET", "/api/curve/versions/{pipe}", self._curve_versions)
+        add("GET", "/api/curve/orders/{order_id}", self._curve_order)
+        add("POST", "/api/curve/refit", self._curve_refit)
+        add("POST", "/api/curve/issue", self._curve_issue)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
         add("GET", "/api/quota", self._quota)
@@ -161,6 +166,30 @@ class Api:
         payload = self._platform.curve_report()
         payload["table"] = self._platform.curve.table.points()
         return payload
+
+    def _curve_segments(self, params: dict, body: dict) -> dict:
+        pipe = params.get("pipe")
+        return self._platform.curve_segments(None if not pipe else str(pipe))
+
+    def _curve_versions(self, params: dict, body: dict) -> dict:
+        return self._platform.curve_versions(str(params.get("pipe", "")))
+
+    def _curve_order(self, params: dict, body: dict) -> dict:
+        return self._platform.quality_order(str(params.get("order_id", "")))
+
+    def _curve_refit(self, params: dict, body: dict) -> dict:
+        raw = body.get("samples")
+        if not isinstance(raw, dict):
+            raise PlantError("请求体 samples 必须是按管段分组的采样列表", component="console")
+        origin = str(body.get("origin", "console"))
+        return self._platform.refit_curves({str(pipe): list(items) for pipe, items in raw.items()}, origin)
+
+    def _curve_issue(self, params: dict, body: dict) -> dict:
+        return self._platform.issue_quality(
+            str(body.get("pipe", "")),
+            _as_float(body, "outdoor_c", self._platform.curve.outdoor_c()),
+            str(body.get("origin", "console")),
+        )
 
     def _forecast(self, params: dict, body: dict) -> dict:
         outside = params.get("outdoor_c")

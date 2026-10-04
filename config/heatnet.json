@@ -20,6 +20,12 @@
       "supply_high_c": 95.0,
       "stale_after_s": 1800.0
     },
+    "curve_fit": {
+      "segment_count": 4,
+      "min_samples_per_segment": 6,
+      "min_samples_total": 30,
+      "change_tolerance_c": 0.5
+    },
     "station": {
       "setpoint_c": 60.0,
       "setpoint_band_c": 2.5,

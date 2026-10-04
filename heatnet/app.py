@@ -15,7 +15,7 @@ from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
-from .errors import PlantError
+from .errors import NamespaceError, PlantError
 from .eventbus import Event, EventBus
 from .ids import IdFactory
 from .ns.registry import NamespaceRegistry
@@ -48,6 +48,8 @@ from .store.metrics import StoreMetrics
 from .store.state import DurableState
 from .temp.curve import HeatCurve
 from .temp.forecast import build_forecast, describe_forecast
+from .temp.segments import CurveSample, SegmentGrid
+from .temp.tuning import CurveCatalog, CurveTuningService
 from .telemetry import TrendBuffer
 from .valve.move import load_valve
 from .valve.queue import ValveCommandQueue, replay_queue
@@ -96,10 +98,23 @@ class Platform:
 
         self.zones = ZoneRegistry()
         self.curve = HeatCurve(self.config.curve)
+        # 分段方式定死为等室外温度：断点只由配置区间与段数决定，不随每轮数据漂移。
+        self.curve_grid = SegmentGrid(self.config.curve, self.config.curve_fit.segment_count)
         self.source = HeatSource(self.config.source)
         self.network = PrimaryNetwork(self.config.primary)
         self.secondary = SecondaryLoop(self.config.secondary)
         self._build_zones()
+        # 数据不足兜底策略按管段定：老旧枝网管型变化大、经验不可靠，沿用上一版；
+        # 新建/改造段没有可信旧版时按经验曲线兜底。策略装配期定死，运行期不改口。
+        self.curve_catalog = CurveCatalog(
+            self.curve_grid,
+            store,
+            policies={name: "inherit" for name in self.zones.names()},
+            now=self.clock.now(),
+        )
+        self.curve_tuning = CurveTuningService(
+            self.curve_catalog, self.config.curve, self.config.curve_fit, self.bus
+        )
         self.mapping = StationMapping(self.zones)
 
         self.stations, self.valves, self.queues = self._build_stations()
@@ -736,6 +751,128 @@ class Platform:
         points = build_forecast(self.curve.table, outside, steps=steps)
         return {"start_outdoor_c": round(outside, 2), **describe_forecast(points)}
 
+    # ---- 供热曲线分段拟合 --------------------------------------------
+
+    @staticmethod
+    def _to_samples(raw_samples: list) -> list[CurveSample]:
+        """把接口/文件传来的采样折成 CurveSample，坏点保留为部分失败。"""
+
+        samples: list[CurveSample] = []
+        for item in raw_samples:
+            if isinstance(item, CurveSample):
+                samples.append(item)
+            elif isinstance(item, dict):
+                samples.append(CurveSample.from_mapping(item))
+        return samples
+
+    def refit_curves(self, samples_by_pipe: dict[str, list], origin: str = "runtime") -> dict:
+        """按管段用一轮运行采样重新分段拟合并发布曲线版本。
+
+        采样丢点属于部分失败：坏点逐点剔除并落审计，不进拟合；某管段有效数据
+        覆盖不足时按该管段装配期定死的兜底策略处理（沿用上一版或经验兜底）。
+        """
+
+        with self._lock:
+            payload = {
+                str(pipe): self._to_samples(list(samples))
+                for pipe, samples in samples_by_pipe.items()
+            }
+            return self.curve_tuning.refit_round(payload, self.clock.now(), origin)
+
+    def curve_segments(self, pipe: str | None = None) -> dict:
+        """返回管段当前版曲线的分段（供控制台展示与审计核对同一份数据）。"""
+
+        with self._lock:
+            names = [pipe] if pipe is not None else self.curve_catalog.pipes()
+            return {
+                "grid": self.curve_grid.describe(),
+                "pipes": {
+                    name: {
+                        "pipe": name,
+                        "version": self.curve_catalog.current_version(name).version,
+                        "source": self.curve_catalog.current_version(name).source,
+                        "fallback": self.curve_catalog.policy(name),
+                        "segments": self.curve_catalog.current_version(name).segments(self.curve_grid),
+                    }
+                    for name in names
+                },
+            }
+
+    def curve_versions(self, pipe: str) -> dict:
+        """返回某管段的曲线版本链与每版改动段。"""
+
+        with self._lock:
+            versions = self.curve_catalog.versions(pipe)
+            return {
+                "pipe": pipe,
+                "current_version": self.curve_catalog.current_version(pipe).version,
+                "fallback": self.curve_catalog.policy(pipe),
+                "versions": [
+                    {
+                        **version.as_dict(),
+                        "segments": version.segments(self.curve_grid),
+                    }
+                    for version in versions
+                ],
+            }
+
+    def issue_quality(self, pipe: str, outdoor_c: float, origin: str = "dispatch") -> dict:
+        """按管段当前版曲线下发一次调质。
+
+        调质在下发这一刻固化曲线版本号与目标供温；之后曲线换代不追溯本指令，
+        已经下发的始终按老版查询，新调质才按新版算。
+        """
+
+        with self._lock:
+            if pipe not in self.curve_catalog.pipes():
+                raise NamespaceError(f"未登记管段: {pipe}", component="temp")
+            order_id = self.ids.next()
+            order = self.curve_catalog.issue_order(
+                pipe, float(outdoor_c), order_id, self.clock.now(), origin
+            )
+            self.bus.publish(
+                Event.of(
+                    "temp",
+                    "temp",
+                    "quality_issued",
+                    asset=pipe,
+                    severity="notice",
+                    message=(
+                        f"管段 {pipe} 按曲线 v{order.curve_version} 下发调质，"
+                        f"目标供温 {order.target_supply_c:.2f}℃"
+                    ),
+                    **order.as_dict(),
+                )
+            )
+            return order.as_dict()
+
+    def quality_order(self, order_id: str) -> dict:
+        """按指令号取已下发调质；其目标供温永远按下发时绑定的老版计算。"""
+
+        with self._lock:
+            for pipe in self.curve_catalog.pipes():
+                for order in self.curve_catalog.orders(pipe):
+                    if order.order_id == order_id:
+                        bound = self.curve_catalog.version(pipe, order.curve_version)
+                        return {
+                            **order.as_dict(),
+                            "bound_curve_source": bound.source,
+                            "current_version": self.curve_catalog.current_version(pipe).version,
+                            "retroactive": False,
+                        }
+        raise KeyError(order_id)
+
+    def curve_catalog_report(self) -> dict:
+        """返回分段网格、各管段版本链与已下发调质汇总。"""
+
+        with self._lock:
+            payload = self.curve_catalog.describe()
+            payload["orders"] = {
+                pipe: [order.as_dict() for order in self.curve_catalog.orders(pipe)]
+                for pipe in self.curve_catalog.pipes()
+            }
+            return payload
+
     def pressure_report(self) -> dict:
         """返回定压基线与二次网定压报告。"""
 
@@ -787,6 +924,7 @@ class Platform:
                 "trips": self.source.trips(),
             },
             "curve": self.curve_report(),
+            "curve_tuning": self.curve_catalog_report(),
             "primary": {
                 **self.network.snapshot().as_dict(),
                 "deviation_t_h": round(self.network.deviation_t_h(), 2),

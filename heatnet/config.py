@@ -114,6 +114,34 @@ class CurveLimits:
 
 
 @dataclass(frozen=True)
+class CurveFitLimits:
+    """供热曲线分段拟合的分段网格、覆盖门限与换代判定。
+
+    分段方式固定为「等室外温度」：在室外温度区间上等分 ``segment_count`` 段，
+    断点网格写死在配置里，不随每轮采样漂移，换代前后才能逐段对比。兜底策略
+    ``inherit`` 表示沿用上一版曲线、``empirical`` 表示按经验高/低供温兜底，
+    策略在装配期按管段登记，运行期不允许逐轮改口。
+    """
+
+    segment_count: int
+    min_samples_per_segment: int
+    min_samples_total: int
+    change_tolerance_c: float
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "CurveFitLimits":
+        limits = cls(
+            segment_count=int(_number(section, "segment_count", minimum=2.0)),
+            min_samples_per_segment=int(_number(section, "min_samples_per_segment", minimum=1.0)),
+            min_samples_total=int(_number(section, "min_samples_total", minimum=1.0)),
+            change_tolerance_c=_number(section, "change_tolerance_c", minimum=0.0),
+        )
+        if limits.min_samples_total < limits.segment_count * limits.min_samples_per_segment:
+            raise ConfigError("总样本门限不得低于各段门限之和", component="config")
+        return limits
+
+
+@dataclass(frozen=True)
 class StationLimits:
     """换热站混水阀行程、设定点带与批量确认约束。"""
 
@@ -284,6 +312,7 @@ class PlatformConfig:
     storage_root: str
     source: SourceLimits
     curve: CurveLimits
+    curve_fit: CurveFitLimits
     station: StationLimits
     primary: PrimaryLimits
     secondary: SecondaryLimits
@@ -308,6 +337,7 @@ class PlatformConfig:
             storage_root=storage_root,
             source=SourceLimits.from_mapping(_section(limits, "source")),
             curve=CurveLimits.from_mapping(_section(limits, "curve")),
+            curve_fit=CurveFitLimits.from_mapping(_section(limits, "curve_fit")),
             station=StationLimits.from_mapping(_section(limits, "station")),
             primary=PrimaryLimits.from_mapping(_section(limits, "primary")),
             secondary=SecondaryLimits.from_mapping(_section(limits, "secondary")),
@@ -338,6 +368,7 @@ def default_config() -> PlatformConfig:
         storage_root="var/state",
         source=SourceLimits(92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35),
         curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0),
+        curve_fit=CurveFitLimits(4, 6, 30, 0.5),
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
         primary=PrimaryLimits(2400.0, 180.0, 4.0),
         secondary=SecondaryLimits(320.0, 260.0, 420.0, 10.0, 45.0),
@@ -369,6 +400,12 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "supply_low_c": cfg.curve.supply_low_c,
                 "supply_high_c": cfg.curve.supply_high_c,
                 "stale_after_s": cfg.curve.stale_after_s,
+            },
+            "curve_fit": {
+                "segment_count": cfg.curve_fit.segment_count,
+                "min_samples_per_segment": cfg.curve_fit.min_samples_per_segment,
+                "min_samples_total": cfg.curve_fit.min_samples_total,
+                "change_tolerance_c": cfg.curve_fit.change_tolerance_c,
             },
             "station": {
                 "setpoint_c": cfg.station.setpoint_c,
